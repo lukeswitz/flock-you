@@ -28,8 +28,8 @@
 #define HEARTBEAT_DURATION 100   // Short heartbeat pulse
 
 // WiFi Promiscuous Mode Configuration
-#define MAX_CHANNEL 13
-#define CHANNEL_HOP_INTERVAL 2500  // milliseconds
+#define MAX_CHANNEL 11
+#define CHANNEL_HOP_INTERVAL 1200  // milliseconds
 
 // Detection Pattern Limits
 #define MAX_SSID_PATTERNS 10
@@ -60,7 +60,8 @@ static const char* mac_prefixes[] = {
     "70:c9:4e", "3c:91:80", "d8:f3:bc", "80:30:49", "14:5a:fc",
     "74:4c:a1", "08:3a:88", "9c:2f:9d",
     
-    // Penguin devices
+    // Penguin devices - these are NOT OUI based, so use local ouis
+    // from the wigle.net db relative to your location 
     "cc:09:24", "ed:c7:63", "e8:ce:56", "ea:0c:ea", "d8:8f:14",
     "f9:d9:c0", "f1:32:f9", "f6:a0:76", "e4:1c:9e", "e7:f2:43",
     "e2:71:33", "da:91:a9", "e1:0e:15", "c8:ae:87", "f4:ed:b2",
