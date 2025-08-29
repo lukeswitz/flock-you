@@ -88,33 +88,7 @@ static unsigned long last_detection_time = 0;
 static unsigned long last_heartbeat = 0;
 static NimBLEScan* pBLEScan;
 
-// ============================================================================
-// SYSTEM BANNER & DISPLAY
-// ============================================================================
 
-static void display_banner(void)
-{
-    printf("\n"
-           "╔══════════════════════════════════════════════════════════════╗\n"
-           "║                                                              ║\n"
-           "║    ███████╗██╗     ██╗      █████╗ ██╗  ██╗██╗  ██╗        ║\n"
-           "║    ██╔════╝██║     ██║     ██╔══██╗██║ ██╔╝██║ ██╔╝        ║\n"
-           "║    ███████╗██║     ██║     ███████║█████╔╝ █████╔╝         ║\n"
-           "║    ╚════██║██║     ██║     ██╔══██║██╔═██╗ ██╔═██╗         ║\n"
-           "║    ███████║███████╗███████╗██║  ██║██║  ██╗██║  ██╗        ║\n"
-           "║    ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝        ║\n"
-           "║                                                              ║\n"
-           "║              FLOCK SAFETY DETECTOR - ENHANCED                ║\n"
-           "║                        SQUAWK v2.0                          ║\n"
-           "║                                                              ║\n"
-           "║    🦅 Multi-Method Detection System 🦅                      ║\n"
-           "║    📡 WiFi + BLE + MAC + Device Name Detection              ║\n"
-           "║    🔊 Audio Alerts with Distinct Sound Patterns             ║\n"
-           "║    🎯 Real-World Device Database Integration                 ║\n"
-           "║    📊 JSON Detection Output with Full Device Info           ║\n"
-           "║                                                              ║\n"
-           "╚══════════════════════════════════════════════════════════════╝\n\n");
-}
 
 // ============================================================================
 // AUDIO SYSTEM
@@ -380,7 +354,6 @@ typedef struct {
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
 {
-    if (triggered) return;
     
     const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
     const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)ppkt->payload;
@@ -416,10 +389,9 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
         if (!triggered) {
             triggered = true;
             flock_detected_beep_sequence();
-        } else {
-            // Update detection time for heartbeat tracking
-            last_detection_time = millis();
         }
+        // Always update detection time for heartbeat tracking
+        last_detection_time = millis();
         return;
     }
     
@@ -431,10 +403,9 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
         if (!triggered) {
             triggered = true;
             flock_detected_beep_sequence();
-        } else {
-            // Update detection time for heartbeat tracking
-            last_detection_time = millis();
         }
+        // Always update detection time for heartbeat tracking
+        last_detection_time = millis();
         return;
     }
 }
@@ -445,7 +416,6 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
 
 class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-        if (triggered) return;
         
         NimBLEAddress addr = advertisedDevice->getAddress();
         std::string addrStr = addr.toString();
@@ -465,10 +435,9 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             if (!triggered) {
                 triggered = true;
                 flock_detected_beep_sequence();
-            } else {
-                // Update detection time for heartbeat tracking
-                last_detection_time = millis();
             }
+            // Always update detection time for heartbeat tracking
+            last_detection_time = millis();
             return;
         }
         
@@ -478,10 +447,9 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             if (!triggered) {
                 triggered = true;
                 flock_detected_beep_sequence();
-            } else {
-                // Update detection time for heartbeat tracking
-                last_detection_time = millis();
             }
+            // Always update detection time for heartbeat tracking
+            last_detection_time = millis();
             return;
         }
     }
@@ -513,8 +481,6 @@ void setup()
 {
     Serial.begin(115200);
     delay(1000);
-    
-    display_banner();
     
     // Initialize buzzer
     pinMode(BUZZER_PIN, OUTPUT);
