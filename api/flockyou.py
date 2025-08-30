@@ -10,6 +10,8 @@ import serial
 import serial.tools.list_ports
 import queue
 import uuid
+import pickle
+from pathlib import Path
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'flockyou_dev_key_2024')
@@ -17,7 +19,12 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logge
 
 # Global variables
 detections = []
+cumulative_detections = []
+session_start_time = datetime.now()
 gps_data = None
+gps_history = []  # Buffer of recent GPS readings for temporal matching
+MAX_GPS_HISTORY = 100  # Keep last 100 GPS readings
+GPS_MATCH_THRESHOLD = 30  # Max seconds between detection and GPS reading
 serial_connection = None
 gps_enabled = False
 flock_device_connected = False
@@ -31,6 +38,59 @@ reconnect_delay = 3  # seconds
 connection_lock = threading.Lock()
 serial_queue = queue.Queue()
 next_detection_id = 1  # Unique ID counter
+settings = {'gps_port': '', 'flock_port': '', 'filter': 'all'}
+
+# Data storage paths
+DATA_DIR = Path('data')
+CUMULATIVE_DATA_FILE = DATA_DIR / 'cumulative_detections.pkl'
+SETTINGS_FILE = DATA_DIR / 'settings.json'
+
+# Ensure data directory exists
+DATA_DIR.mkdir(exist_ok=True)
+
+# Persistent storage functions
+def load_cumulative_detections():
+    """Load cumulative detections from disk"""
+    global cumulative_detections
+    try:
+        if CUMULATIVE_DATA_FILE.exists():
+            with open(CUMULATIVE_DATA_FILE, 'rb') as f:
+                cumulative_detections = pickle.load(f)
+            print(f"Loaded {len(cumulative_detections)} cumulative detections")
+        else:
+            cumulative_detections = []
+    except Exception as e:
+        print(f"Error loading cumulative detections: {e}")
+        cumulative_detections = []
+
+def save_cumulative_detections():
+    """Save cumulative detections to disk"""
+    try:
+        with open(CUMULATIVE_DATA_FILE, 'wb') as f:
+            pickle.dump(cumulative_detections, f)
+        print(f"Saved {len(cumulative_detections)} cumulative detections")
+    except Exception as e:
+        print(f"Error saving cumulative detections: {e}")
+
+def load_settings():
+    """Load settings from disk"""
+    global settings
+    try:
+        if SETTINGS_FILE.exists():
+            with open(SETTINGS_FILE, 'r') as f:
+                settings.update(json.load(f))
+            print(f"Loaded settings: {settings}")
+    except Exception as e:
+        print(f"Error loading settings: {e}")
+
+def save_settings():
+    """Save settings to disk"""
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f, indent=2)
+        print(f"Saved settings: {settings}")
+    except Exception as e:
+        print(f"Error saving settings: {e}")
 
 # Load OUI database
 def load_oui_database():
@@ -78,7 +138,7 @@ class GPSData:
         self.satellites = 0
 
 def parse_nmea_sentence(sentence):
-    """Parse NMEA GPS sentence"""
+    """Parse NMEA GPS sentence with improved accuracy"""
     if not sentence.startswith('$'):
         return None
     
@@ -88,33 +148,49 @@ def parse_nmea_sentence(sentence):
     
     sentence_type = parts[0]
     
-    if sentence_type == '$GPGGA':  # Global Positioning System Fix Data
+    if sentence_type in ['$GPGGA', '$GNGGA']:  # Global Positioning System Fix Data (GPS + GLONASS)
         if len(parts) >= 15:
             try:
                 time_str = parts[1]
-                lat = float(parts[2]) / 100
+                lat_raw = parts[2]
                 lat_dir = parts[3]
-                lon = float(parts[4]) / 100
+                lon_raw = parts[4]
                 lon_dir = parts[5]
-                fix_quality = int(parts[6])
-                satellites = int(parts[7])
+                fix_quality = int(parts[6]) if parts[6] else 0
+                satellites = int(parts[7]) if parts[7] else 0
+                hdop = float(parts[8]) if parts[8] else 0  # Horizontal Dilution of Precision
                 altitude = float(parts[9]) if parts[9] else 0
                 
-                # Convert to decimal degrees
+                # Skip if no fix
+                if fix_quality == 0 or not lat_raw or not lon_raw:
+                    return None
+                
+                # Convert NMEA format (DDMM.MMMM) to decimal degrees with high precision
+                lat_degrees = int(lat_raw[:2])
+                lat_minutes = float(lat_raw[2:])
+                lat = lat_degrees + (lat_minutes / 60.0)
+                
+                lon_degrees = int(lon_raw[:3])
+                lon_minutes = float(lon_raw[3:])
+                lon = lon_degrees + (lon_minutes / 60.0)
+                
+                # Apply direction
                 if lat_dir == 'S':
                     lat = -lat
                 if lon_dir == 'W':
                     lon = -lon
                 
                 return {
-                    'latitude': lat,
-                    'longitude': lon,
-                    'altitude': altitude,
+                    'latitude': round(lat, 8),  # 8 decimal places for ~1.1mm accuracy
+                    'longitude': round(lon, 8),
+                    'altitude': round(altitude, 3),
                     'fix_quality': fix_quality,
                     'satellites': satellites,
+                    'hdop': hdop,
                     'timestamp': time_str
                 }
-            except (ValueError, IndexError):
+            except (ValueError, IndexError) as e:
+                print(f"GPS parsing error: {e}")
                 return None
     
     return None
@@ -144,6 +220,17 @@ def gps_reader():
                     parsed = parse_nmea_sentence(line)
                     if parsed:
                         gps_data = parsed
+                        
+                        # Add to GPS history with timestamp for temporal matching
+                        if parsed.get('fix_quality') > 0:
+                            gps_entry = parsed.copy()
+                            gps_entry['system_timestamp'] = time.time()
+                            gps_history.append(gps_entry)
+                            
+                            # Keep only recent GPS readings
+                            if len(gps_history) > MAX_GPS_HISTORY:
+                                gps_history.pop(0)
+                        
                         safe_socket_emit('gps_update', parsed)
                         
                         # Also send parsed GPS data to terminal
@@ -202,27 +289,144 @@ def flock_reader():
                     break
             time.sleep(0.1)
 
+def find_best_gps_match(detection_timestamp):
+    """Find the GPS reading closest in time to the detection timestamp"""
+    global gps_history
+    
+    if not gps_history:
+        return None
+    
+    try:
+        # Convert detection timestamp to epoch time
+        if isinstance(detection_timestamp, str):
+            # Try parsing ISO format first
+            try:
+                dt = datetime.fromisoformat(detection_timestamp.replace('Z', '+00:00'))
+            except:
+                # Try parsing the display format
+                dt = datetime.strptime(detection_timestamp, '%Y-%m-%d %H:%M:%S')
+            detection_time = dt.timestamp()
+        else:
+            detection_time = detection_timestamp
+        
+        best_match = None
+        min_time_diff = float('inf')
+        
+        for gps_entry in gps_history:
+            gps_time = gps_entry['system_timestamp']
+            time_diff = abs(detection_time - gps_time)
+            
+            if time_diff < min_time_diff and time_diff <= GPS_MATCH_THRESHOLD:
+                min_time_diff = time_diff
+                best_match = gps_entry
+        
+        return best_match
+    except Exception as e:
+        print(f"Error finding GPS match: {e}")
+        return None
+
+def validate_gps_data(gps_data):
+    """Validate GPS data integrity"""
+    if not gps_data:
+        return False, "No GPS data"
+    
+    lat = gps_data.get('latitude')
+    lon = gps_data.get('longitude')
+    
+    if lat is None or lon is None:
+        return False, "Missing coordinates"
+    
+    # Basic coordinate validation
+    if not (-90 <= lat <= 90):
+        return False, f"Invalid latitude: {lat}"
+    
+    if not (-180 <= lon <= 180):
+        return False, f"Invalid longitude: {lon}"
+    
+    fix_quality = gps_data.get('fix_quality', 0)
+    if fix_quality < 1:
+        return False, f"Poor GPS fix quality: {fix_quality}"
+    
+    return True, "Valid GPS data"
+
 def add_detection_from_serial(data):
     """Add detection from serial data - counts detections per MAC address"""
-    global detections, gps_data, next_detection_id
+    global detections, cumulative_detections, gps_data, next_detection_id
     
-    # Add GPS data if available
-    if gps_data and gps_data.get('fix_quality') > 0:
-        data['gps'] = {
-            'latitude': gps_data.get('latitude'),
-            'longitude': gps_data.get('longitude'),
-            'altitude': gps_data.get('altitude'),
-            'timestamp': gps_data.get('timestamp'),
-            'satellites': gps_data.get('satellites'),
-            'fix_quality': gps_data.get('fix_quality')
-        }
+    # Add server timestamp first (system time when detection was processed)
+    system_time = time.time()
+    data['server_timestamp'] = datetime.fromtimestamp(system_time).isoformat()
+    
+    # Try to find the best GPS match for this detection's timestamp
+    best_gps = find_best_gps_match(system_time)
+    preferred_timestamp = None
+    
+    if best_gps:
+        # Validate GPS data before using it
+        is_valid, validation_msg = validate_gps_data(best_gps)
+        if is_valid:
+            time_diff = abs(system_time - best_gps['system_timestamp'])
+            data['gps'] = {
+                'latitude': best_gps.get('latitude'),
+                'longitude': best_gps.get('longitude'),
+                'altitude': best_gps.get('altitude'),
+                'timestamp': best_gps.get('timestamp'),
+                'satellites': best_gps.get('satellites'),
+                'fix_quality': best_gps.get('fix_quality'),
+                'time_diff': time_diff,
+                'match_quality': 'temporal'
+            }
+            # Prefer GPS timestamp when available and accurate
+            if time_diff < 5:  # Very close temporal match
+                preferred_timestamp = best_gps.get('timestamp')
+                print(f"✓ Using GPS timestamp for MAC {data.get('mac_address', 'unknown')}: {time_diff:.2f}s difference")
+            else:
+                print(f"✓ GPS temporal match for MAC {data.get('mac_address', 'unknown')}: {time_diff:.2f}s difference")
+        else:
+            print(f"⚠ Invalid GPS data for temporal match: {validation_msg}")
+            best_gps = None
+    
+    # Fallback to current GPS if no good temporal match
+    if not best_gps and gps_data and gps_data.get('fix_quality') > 0:
+        is_valid, validation_msg = validate_gps_data(gps_data)
+        if is_valid:
+            data['gps'] = {
+                'latitude': gps_data.get('latitude'),
+                'longitude': gps_data.get('longitude'),
+                'altitude': gps_data.get('altitude'),
+                'timestamp': gps_data.get('timestamp'),
+                'satellites': gps_data.get('satellites'),
+                'fix_quality': gps_data.get('fix_quality'),
+                'time_diff': None,  # Unknown time difference
+                'match_quality': 'current'
+            }
+            # Use current GPS timestamp if available
+            preferred_timestamp = gps_data.get('timestamp')
+            print(f"○ Using current GPS timestamp for MAC {data.get('mac_address', 'unknown')} (no temporal match)")
+        else:
+            print(f"⚠ Current GPS data invalid: {validation_msg}")
+    
+    # Set timestamps - prefer GPS timestamp when available
+    if preferred_timestamp:
+        data['timestamp'] = preferred_timestamp
+        data['detection_time'] = preferred_timestamp
+        data['timestamp_source'] = 'gps'
+        print(f"📍 Using GPS timestamp as primary timestamp for {data.get('mac_address', 'unknown')}")
+    else:
+        # Fallback to system timestamps
+        system_dt = datetime.fromtimestamp(system_time)
+        data['timestamp'] = system_dt.isoformat()
+        data['detection_time'] = system_dt.strftime('%Y-%m-%d %H:%M:%S')
+        data['timestamp_source'] = 'system'
+        print(f"🕐 Using system timestamp for {data.get('mac_address', 'unknown')} (no GPS available)")
+    
+    # Log if no GPS could be assigned
+    if not data.get('gps'):
+        print(f"✗ No valid GPS data available for MAC {data.get('mac_address', 'unknown')}")
     
     # Add manufacturer information
     if 'mac_address' in data:
         data['manufacturer'] = lookup_manufacturer(data['mac_address'])
-    
-    # Add server timestamp
-    data['server_timestamp'] = datetime.now().isoformat()
     
     # Check if we already have a detection for this MAC address
     mac_address = data.get('mac_address')
@@ -252,6 +456,13 @@ def add_detection_from_serial(data):
         if data.get('gps'):
             existing_detection['gps'] = data['gps']
         
+        # Update cumulative detections
+        for cum_detection in cumulative_detections:
+            if cum_detection.get('mac_address') == mac_address:
+                cum_detection.update(existing_detection)
+                break
+        save_cumulative_detections()
+        
         # Emit updated detection
         safe_socket_emit('detection_updated', existing_detection)
         print(f"Updated detection: MAC {mac_address}, Count: {existing_detection['detection_count']}, Method: {existing_detection.get('detection_method')}")
@@ -265,6 +476,10 @@ def add_detection_from_serial(data):
         data['last_seen'] = datetime.now().isoformat()
         
         detections.append(data)
+        
+        # Add to cumulative detections
+        cumulative_detections.append(data.copy())
+        save_cumulative_detections()
         
         # Emit to connected clients
         safe_socket_emit('new_detection', data)
@@ -424,11 +639,19 @@ def index():
 def get_detections():
     """Get all detections with optional filtering"""
     filter_type = request.args.get('filter', 'all')
+    data_type = request.args.get('type', 'session')
     
-    if filter_type == 'all':
-        return jsonify(detections)
+    # Choose data source
+    if data_type == 'cumulative':
+        source_data = cumulative_detections
     else:
-        filtered = [d for d in detections if d.get('detection_method') == filter_type]
+        source_data = detections
+    
+    # Apply filter
+    if filter_type == 'all':
+        return jsonify(source_data)
+    else:
+        filtered = [d for d in source_data if d.get('detection_method') == filter_type]
         return jsonify(filtered)
 
 @app.route('/api/detections', methods=['POST'])
@@ -581,42 +804,62 @@ def get_flock_ports():
 
 @app.route('/api/export/csv', methods=['GET'])
 def export_csv():
-    """Export detections as CSV"""
-    if not detections:
+    """Export session detections as CSV"""
+    export_type = request.args.get('type', 'session')
+    
+    if export_type == 'cumulative':
+        data_to_export = cumulative_detections
+        filename_prefix = "flockyou_cumulative"
+    else:
+        data_to_export = detections
+        filename_prefix = f"flockyou_session_{session_start_time.strftime('%Y%m%d_%H%M%S')}"
+    
+    if not data_to_export:
         return jsonify({'status': 'error', 'message': 'No detections to export'}), 400
     
-    filename = f"flockyou_detections_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"{filename_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     filepath = os.path.join('exports', filename)
     
     os.makedirs('exports', exist_ok=True)
     
     with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = [
-            'timestamp', 'detection_time', 'protocol', 'detection_method',
-            'ssid', 'mac_address', 'manufacturer', 'alias', 'rssi', 'signal_strength', 'channel',
-            'latitude', 'longitude', 'altitude', 'gps_timestamp', 'satellites'
+            'timestamp', 'detection_time', 'server_timestamp', 'protocol', 'detection_method',
+            'ssid', 'device_name', 'mac_address', 'manufacturer', 'alias', 'rssi', 'last_rssi', 
+            'signal_strength', 'channel', 'last_channel', 'detection_count',
+            'latitude', 'longitude', 'altitude', 'gps_timestamp', 'satellites', 'fix_quality', 'gps_time_diff', 'gps_match_quality', 'timestamp_source'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         
-        for detection in detections:
+        for detection in data_to_export:
+            gps_data = detection.get('gps', {})
             row = {
                 'timestamp': detection.get('timestamp'),
                 'detection_time': detection.get('detection_time'),
+                'server_timestamp': detection.get('server_timestamp'),
                 'protocol': detection.get('protocol'),
                 'detection_method': detection.get('detection_method'),
                 'ssid': detection.get('ssid', ''),
+                'device_name': detection.get('device_name', ''),
                 'mac_address': detection.get('mac_address'),
                 'manufacturer': detection.get('manufacturer', 'Unknown'),
                 'alias': detection.get('alias', ''),
                 'rssi': detection.get('rssi'),
+                'last_rssi': detection.get('last_rssi'),
                 'signal_strength': detection.get('signal_strength'),
                 'channel': detection.get('channel'),
-                'latitude': detection.get('gps', {}).get('latitude'),
-                'longitude': detection.get('gps', {}).get('longitude'),
-                'altitude': detection.get('gps', {}).get('altitude'),
-                'gps_timestamp': detection.get('gps', {}).get('timestamp'),
-                'satellites': detection.get('gps', {}).get('satellites')
+                'last_channel': detection.get('last_channel'),
+                'detection_count': detection.get('detection_count', 1),
+                'latitude': gps_data.get('latitude'),
+                'longitude': gps_data.get('longitude'),
+                'altitude': gps_data.get('altitude'),
+                'gps_timestamp': gps_data.get('timestamp'),
+                'satellites': gps_data.get('satellites'),
+                'fix_quality': gps_data.get('fix_quality'),
+                'gps_time_diff': gps_data.get('time_diff'),
+                'gps_match_quality': gps_data.get('match_quality'),
+                'timestamp_source': detection.get('timestamp_source', 'unknown')
             }
             writer.writerow(row)
     
@@ -625,10 +868,21 @@ def export_csv():
 @app.route('/api/export/kml', methods=['GET'])
 def export_kml():
     """Export detections as KML"""
-    if not detections:
+    export_type = request.args.get('type', 'session')
+    
+    if export_type == 'cumulative':
+        data_to_export = cumulative_detections
+        filename_prefix = "flockyou_cumulative"
+        document_name = "Flock You Cumulative Detections"
+    else:
+        data_to_export = detections
+        filename_prefix = f"flockyou_session_{session_start_time.strftime('%Y%m%d_%H%M%S')}"
+        document_name = f"Flock You Session Detections - {session_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    if not data_to_export:
         return jsonify({'status': 'error', 'message': 'No detections to export'}), 400
     
-    filename = f"flockyou_detections_{datetime.now().strftime('%Y%m%d_%H%M%S')}.kml"
+    filename = f"{filename_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.kml"
     filepath = os.path.join('exports', filename)
     
     os.makedirs('exports', exist_ok=True)
@@ -636,29 +890,67 @@ def export_kml():
     kml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
-    <name>Flock You Detections</name>
-    <description>Surveillance device detections with GPS coordinates</description>
+    <name>{document_name}</name>
+    <description>Surveillance device detections with GPS coordinates ({len(data_to_export)} detections)</description>
 """
     
-    for i, detection in enumerate(detections):
+    for i, detection in enumerate(data_to_export):
         gps = detection.get('gps', {})
         if gps.get('latitude') and gps.get('longitude'):
+            # Use alias if available, otherwise use detection number
+            placemark_name = detection.get('alias') or f"Detection {i+1}"
+            
+            # GPS accuracy indicator
+            gps_accuracy = ""
+            if gps.get('time_diff') is not None:
+                time_diff = gps.get('time_diff')
+                if time_diff < 5:
+                    gps_accuracy = f" (✓ Precise: {time_diff:.1f}s)"
+                elif time_diff < 15:
+                    gps_accuracy = f" (~ Good: {time_diff:.1f}s)"
+                else:
+                    gps_accuracy = f" (⚠ Approximate: {time_diff:.1f}s)"
+            else:
+                gps_accuracy = " (? Unknown accuracy)"
+            
+            # Build device info
+            device_info = ""
+            if detection.get('ssid'):
+                device_info += f"<b>SSID:</b> {detection.get('ssid')}<br/>"
+            if detection.get('device_name'):
+                device_info += f"<b>Device Name:</b> {detection.get('device_name')}<br/>"
+            
+            # RSSI info
+            rssi_info = detection.get('last_rssi') or detection.get('rssi', 'N/A')
+            
+            # Channel info
+            channel_info = detection.get('last_channel') or detection.get('channel', 'N/A')
+            
             kml_content += f"""
     <Placemark>
-        <name>Detection {i+1}</name>
+        <name>{placemark_name}</name>
         <description>
             <![CDATA[
             <b>Protocol:</b> {detection.get('protocol')}<br/>
-            <b>Method:</b> {detection.get('detection_method')}<br/>
-            <b>SSID:</b> {detection.get('ssid', 'N/A')}<br/>
-            <b>MAC:</b> {detection.get('mac_address')}<br/>
+            <b>Detection Method:</b> {detection.get('detection_method')}<br/>
+            {device_info}
+            <b>MAC Address:</b> {detection.get('mac_address')}<br/>
             <b>Manufacturer:</b> {detection.get('manufacturer', 'Unknown')}<br/>
-            <b>Alias:</b> {detection.get('alias', 'N/A')}<br/>
-            <b>RSSI:</b> {detection.get('rssi')} dBm<br/>
-            <b>Signal:</b> {detection.get('signal_strength')}<br/>
-            <b>Channel:</b> {detection.get('channel')}<br/>
-            <b>Time:</b> {detection.get('detection_time')}<br/>
-            <b>GPS Satellites:</b> {gps.get('satellites', 'N/A')}
+            <b>Alias:</b> {detection.get('alias', 'None')}<br/>
+            <b>RSSI:</b> {rssi_info} dBm<br/>
+            <b>Signal Strength:</b> {detection.get('signal_strength', 'N/A')}<br/>
+            <b>Channel:</b> {channel_info}<br/>
+            <b>Detection Count:</b> {detection.get('detection_count', 1)}<br/>
+            <b>Detection Time:</b> {detection.get('detection_time', 'N/A')}<br/>
+            <b>Server Timestamp:</b> {detection.get('server_timestamp', 'N/A')}<br/>
+            <hr/>
+            <b>GPS Coordinates:</b> {gps.get('latitude'):.6f}, {gps.get('longitude'):.6f}{gps_accuracy}<br/>
+            <b>GPS Altitude:</b> {gps.get('altitude', 'N/A')} m<br/>
+            <b>GPS Satellites:</b> {gps.get('satellites', 'N/A')}<br/>
+            <b>GPS Fix Quality:</b> {gps.get('fix_quality', 'N/A')}<br/>
+            <b>GPS Match Quality:</b> {gps.get('match_quality', 'N/A')}<br/>
+            <b>GPS Timestamp:</b> {gps.get('timestamp', 'N/A')}<br/>
+            <b>Timestamp Source:</b> {detection.get('timestamp_source', 'Unknown').upper()}
             ]]>
         </description>
         <Point>
@@ -678,12 +970,13 @@ def export_kml():
 
 @app.route('/api/clear', methods=['POST'])
 def clear_detections():
-    """Clear all detections"""
-    global detections, next_detection_id
+    """Clear session detections"""
+    global detections, next_detection_id, session_start_time
     detections.clear()
     next_detection_id = 1  # Reset ID counter
+    session_start_time = datetime.now()  # Reset session start time
     safe_socket_emit('detections_cleared', {})
-    return jsonify({'status': 'success', 'message': 'All detections cleared'})
+    return jsonify({'status': 'success', 'message': 'Session detections cleared'})
 
 @app.route('/api/test/detection', methods=['POST'])
 def test_detection():
@@ -740,6 +1033,39 @@ def update_detection_alias():
             return jsonify({'status': 'success', 'message': 'Alias updated'})
     
     return jsonify({'status': 'error', 'message': 'Detection not found'}), 404
+
+@app.route('/api/settings', methods=['GET'])
+def get_settings():
+    """Get current settings"""
+    return jsonify(settings)
+
+@app.route('/api/settings', methods=['POST'])
+def update_settings():
+    """Update settings"""
+    global settings
+    data = request.json
+    settings.update(data)
+    save_settings()
+    return jsonify({'status': 'success', 'settings': settings})
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get detection statistics"""
+    return jsonify({
+        'session': {
+            'total': len(detections),
+            'wifi': len([d for d in detections if d.get('protocol') == 'wifi']),
+            'ble': len([d for d in detections if d.get('protocol') in ['bluetooth_le', 'bluetooth_classic']]),
+            'gps': len([d for d in detections if d.get('gps')]),
+            'start_time': session_start_time.isoformat()
+        },
+        'cumulative': {
+            'total': len(cumulative_detections),
+            'wifi': len([d for d in cumulative_detections if d.get('protocol') == 'wifi']),
+            'ble': len([d for d in cumulative_detections if d.get('protocol') in ['bluetooth_le', 'bluetooth_classic']]),
+            'gps': len([d for d in cumulative_detections if d.get('gps')])
+        }
+    })
 
 @app.route('/api/oui/search', methods=['POST'])
 def search_oui():
@@ -934,8 +1260,10 @@ def handle_serial_terminal_request(data):
         emit('serial_error', {'message': f'Failed to start terminal: {str(e)}'})
 
 if __name__ == '__main__':
-    # Load OUI database on startup
+    # Load data on startup
     load_oui_database()
+    load_cumulative_detections()
+    load_settings()
     
     # Start connection monitor thread
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
